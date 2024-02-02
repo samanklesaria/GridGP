@@ -1,37 +1,40 @@
 module GridGP
+export GridApprox, CG_GP, Grid
 
 using ToeplitzMatrices, AbstractGPs, Statistics, LinearMaps, FFTW,
 FillArrays, IterativeSolvers, KernelFunctions, Kronecker,
-SparseArrays, Unzip
+SparseArrays, Unzip, SparseArrays
 
-using SparseArrays
+KernelFunctions.kernelmatrix(k::KernelFunctions.SimpleKernel, x::AbstractRange) = 
+  SymmetricToeplitz(k.(x[1], x))
 
-struct Stationary{T}
-  k::T
-end
-
-function KernelFunctions.kernelmatrix(k::Stationary, x::StepRange)
-  SymmetricToeplitz(k.k.(x[1], x))
-end
-
-function KernelFunctions.kernelmatrix(k::Stationary, x::StepRange,
-  y::StepRange)
+function KernelFunctions.kernelmatrix(k::KernelFunctions.SimpleKernel,
+    x::AbstractRange, y::AbstractRange)
   if x === y
-    kernelmatrix(k, x,y)
-  elseif x.step == y.step
-    Toeplitz(k.k.(x, y[1]), k.k.(x[1], y))
+    SymmetricToeplitz(k.k.(x[1], x))
+  elseif step(x) == step(y)
+    Toeplitz(k.(x, y[1]), k.k.(x[1], y))
   else
-    kernelmatrix(k.k, x, y)
+    k.(x, y')
   end
 end
 
-struct GridApprox{T,G,L}
+struct GridApprox{T,G,L} <: Kernel
   k::T
   g::G
   k_uu::L
 end
 
-GridApprox(k, g) = GridApprix(k, g, LinearMap(kernelmatrix(k, g)))
+struct Grid{T}
+  dims::T
+end
+  
+function KernelFunctions.kernelmatrix(k::KernelTensorProduct,
+    x::Grid)
+  kron(kernelmatrix.(k.kernels, x.dims)...)
+end
+
+GridApprox(k, g) = GridApprox(k, g, LinearMap(kernelmatrix(k, g)))
 
 function KernelFunctions.kernelmatrix(g::GridApprox, x::AbstractVector)
   W = weights(g.g, x)
@@ -45,26 +48,31 @@ function KernelFunctions.kernelmatrix(g::GridApprox,
   W1 * g.k_uu * W2'
 end
 
-function grid_ix(pts::StepRange, pt::Number)
-    Int(1 + ceil((pt - pts.start) / pts.step))
+function grid_ix(pts::AbstractRange, pt::T) where {T <: Number}
+    Int(1 + ceil((pt - pts[1]) / T(step(pts))))
 end
 
-function weights(pts, xs)
-    ixs, vals = unzip(weight.(Ref(pts), xs))
-    i = 1:length(xs)
-    sparse(vec([i i]), collect(Iterators.flatten(ixs)),
-      collect(Iterators.flatten(vals)))
+function weights(pts::AbstractRange, xs::AbstractVector{T}) where {T <: Number}
+  ivec = Int[]
+  jvec = Int[]
+  valvec = Float64[]
+  ix_data = weight.(Ref(pts), xs)
+  for (i, (js, vals)) in enumerate(ix_data)
+      append!(ivec, fill(i, length(js)))
+      append!(jvec, js)
+      append!(valvec, vals)
+  end
+  sparse(ivec, jvec, valvec, length(xs), length(pts))
 end
 
-function weight(pts::StepRange, x::Float64)
+function weight(pts::AbstractRange, x::Number)
     ix = grid_ix(pts, x)
     if pts[ix] == x
         return ([ix], [1.])
-    end
-    closest = pts[[ix - 1, ix]]
-    if closest == 1
-        ([closest], [1.])
+    elseif ix == 1
+        return ([1], [1.])
     else
+        closest = pts[[ix - 1, ix]]
         l = closest[2] - closest[1]
         vals = abs.(x .- closest) ./ l
         ([ix, ix-1], vals)
@@ -86,6 +94,8 @@ function AbstractGPs.posterior(fx::AbstractGPs.FiniteGP{<:CG_GP}, y::AbstractVec
     α = cg(K, δ)
     AbstractGPs.PosteriorGP(fx.f, (α=α, C=K, x=fx.x, δ=δ))
 end
+
+# TODO: logpdf for cg-gps
 
 # function logpdf(fx::AbstractGP.FiniteGP{<:CG_GP}, y::AbstractVecOrMat{<:Real})
 #   post = posterior(fx, y)
