@@ -1,9 +1,11 @@
 module GridGP
 export GridApprox, CG_GP, Grid
 
-using ToeplitzMatrices, AbstractGPs, Statistics, LinearMaps, FFTW,
-FillArrays, IterativeSolvers, KernelFunctions, Kronecker,
-SparseArrays, Unzip, SparseArrays
+using ToeplitzMatrices, AbstractGPs, Statistics, FFTW,
+FillArrays, IterativeSolvers, KernelFunctions,
+SparseArrays, SparseArrays, Interpolations
+import LinearMaps: LinearMap
+import Distributions
 
 KernelFunctions.kernelmatrix(k::KernelFunctions.SimpleKernel, x::AbstractRange) = 
   SymmetricToeplitz(k.(x[1], x))
@@ -19,66 +21,64 @@ function KernelFunctions.kernelmatrix(k::KernelFunctions.SimpleKernel,
   end
 end
 
-struct GridApprox{T,G,L} <: Kernel
+struct Grid{T}
+  ranges::T
+end
+
+struct GridApprox{T,R,L} <: Kernel
   k::T
-  g::G
+  g::Grid{R}
   k_uu::L
 end
 
-struct Grid{T}
-  dims::T
-end
-  
+GridApprox(k, g) = GridApprox(k, g, kernelmatrix(k, g))
+
 function KernelFunctions.kernelmatrix(k::KernelTensorProduct,
     x::Grid)
-  kron(kernelmatrix.(k.kernels, x.dims)...)
+  kron(LinearMap.(kernelmatrix.(k.kernels, x.ranges))...)
 end
 
-GridApprox(k, g) = GridApprox(k, g, LinearMap(kernelmatrix(k, g)))
-
-function KernelFunctions.kernelmatrix(g::GridApprox, x::AbstractVector)
-  W = weights(g.g, x)
-  W * g.k_uu * W'
-end
-
-function KernelFunctions.kernelmatrix(g::GridApprox,
-    x::AbstractVector, y::AbstractVector)
-  W1 = weights(g.g, x)
-  W2 = weights(g.g, y)
-  W1 * g.k_uu * W2'
-end
-
-function grid_ix(pts::AbstractRange, pt::T) where {T <: Number}
-    Int(1 + ceil((pt - pts[1]) / T(step(pts))))
-end
-
-function weights(pts::AbstractRange, xs::AbstractVector{T}) where {T <: Number}
-  ivec = Int[]
-  jvec = Int[]
-  valvec = Float64[]
-  ix_data = weight.(Ref(pts), xs)
-  for (i, (js, vals)) in enumerate(ix_data)
-      append!(ivec, fill(i, length(js)))
-      append!(jvec, js)
-      append!(valvec, vals)
+function weights(itp, ranges, dims, xs)
+  inits = [r[1] for r in ranges]
+  steps = eltype(xs[1]).(step.(ranges))
+  rs = Int[]
+  cs = Int[]
+  vals = Float64[]
+  n = 0 
+  for (i, x) in enumerate(xs)
+    x0 = Tuple((x .- inits) ./ steps .+ 1)
+    wis = Interpolations.weightedindexes((Interpolations.value_weights,),
+      Interpolations.itpinfo(itp)..., x0)
+    v = kron(to_sparse.(wis, dims)...)
+    n = length(v)
+    append!(cs, v.nzind)
+    append!(rs, fill(i, length(v.nzind)))
+    append!(vals, v.nzval)
   end
-  sparse(ivec, jvec, valvec, length(xs), length(pts))
+  sparse(rs, cs, vals, length(xs), n)
 end
 
-function weight(pts::AbstractRange, x::Number)
-    ix = grid_ix(pts, x)
-    if pts[ix] == x
-        return ([ix], [1.])
-    elseif ix == 1
-        return ([1], [1.])
-    else
-        closest = pts[[ix - 1, ix]]
-        l = closest[2] - closest[1]
-        vals = abs.(x .- closest) ./ l
-        ([ix, ix-1], vals)
-    end
+function KernelFunctions.kernelmatrix(k::GridApprox, xs::AbstractVector)
+  dims = length.(k.g.ranges)
+  itp = interpolate(Zeros(dims), BSpline(Cubic()))
+  W = weights(itp, k.g.ranges, dims, xs)
+  W * k.k_uu * W'
 end
 
+function KernelFunctions.kernelmatrix(k::GridApprox,
+  xs::AbstractVector, ys::AbstractVector)
+  dims = length.(k.g.ranges)
+  itp = interpolate(Zeros(dims), BSpline(Cubic()))
+  W1 = weights(itp, k.g.ranges, dims, ys)
+  W2 = weights(itp, k.g.ranges, dims, xs)
+  W2 * k.k_uu * W1'
+end
+
+function to_sparse(w, dim)
+  ixs = clamp.(w.istart : (w.istart + length(w.weights) - 1), 1, dim)
+  sparsevec(ixs, collect(w.weights), dim)
+end
+ 
 struct CG_GP{F} <: AbstractGPs.AbstractGP
     f::F
 end
@@ -95,14 +95,20 @@ function AbstractGPs.posterior(fx::AbstractGPs.FiniteGP{<:CG_GP}, y::AbstractVec
     AbstractGPs.PosteriorGP(fx.f, (α=α, C=K, x=fx.x, δ=δ))
 end
 
-# TODO: logpdf for cg-gps
 
-# function logpdf(fx::AbstractGP.FiniteGP{<:CG_GP}, y::AbstractVecOrMat{<:Real})
-#   post = posterior(fx, y)
-#   quadform = post.data.α' * post.data.δ
-#   logdet = sum(log.(eigvals(post.data.K) .+ fx.Σy.diag))
-#   k = length(y)
-#   -0.5 * logdet -(k/2) * log(2 * pi) - 0.5 * quadform
-# end
+function Distributions.logpdf(fx::AbstractGPs.FiniteGP{<:CG_GP}, y::AbstractVecOrMat{<:Real})
+  k = length(y)
+  post = posterior(fx, y)
+  quadform = post.data.α' * post.data.δ
+  A = post.data.C
+  m = max(1, trunc(Int, k / 3))
+  X0 = rand(eltype(A), size(A, 1), m)
+
+  highest = lobpcg(A, true, X0, m).λ
+  lowest = lobpcg(A, false, X0, m).λ
+  mid_guess = log((highest[end] + lowest[end]) / 2)
+  logdet = sum(log.(highest)) + sum(log.(lowest)) + mid_guess * (k - (2 * m))
+  -0.5 * logdet -(k/2) * log(2 * pi) - 0.5 * quadform
+end
 
 end # module GridGP
