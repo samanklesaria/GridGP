@@ -3,9 +3,10 @@ export GridApprox, CG_GP, Grid
 
 using ToeplitzMatrices, AbstractGPs, Statistics, FFTW,
 FillArrays, IterativeSolvers, KernelFunctions,
-SparseArrays, SparseArrays, Interpolations
-import LinearMaps: LinearMap
+SparseArrays, SparseArrays, Interpolations, LinearAlgebra
+import LinearMaps: LinearMap, LinearCombination, CompositeMap, WrappedMap
 import Distributions
+import Kronecker
 
 KernelFunctions.kernelmatrix(k::KernelFunctions.SimpleKernel, x::AbstractRange) = 
   SymmetricToeplitz(k.(x[1], x))
@@ -35,7 +36,7 @@ GridApprox(k, g) = GridApprox(k, g, kernelmatrix(k, g))
 
 function KernelFunctions.kernelmatrix(k::KernelTensorProduct,
     x::Grid)
-  kron(LinearMap.(kernelmatrix.(k.kernels, x.ranges))...)
+  LinearMap(Kronecker.kronecker(kernelmatrix.(k.kernels, x.ranges)...))
 end
 
 function weights(itp, ranges, dims, xs)
@@ -95,20 +96,17 @@ function AbstractGPs.posterior(fx::AbstractGPs.FiniteGP{<:CG_GP}, y::AbstractVec
     AbstractGPs.PosteriorGP(fx.f, (α=α, C=K, x=fx.x, δ=δ))
 end
 
+function logdet(A::LinearCombination{T, Tuple{S, WrappedMap{T,
+    Diagonal{T, Fill}}}}) where {S,T}
+  s = A.maps[2].lmap.diag.value
+  sum(logsumexp(logdet(A.maps[1]) .+ s))
+end
 
 function Distributions.logpdf(fx::AbstractGPs.FiniteGP{<:CG_GP}, y::AbstractVecOrMat{<:Real})
   k = length(y)
   post = posterior(fx, y)
   quadform = post.data.α' * post.data.δ
-  A = post.data.C
-  m = max(1, trunc(Int, k / 3))
-  X0 = rand(eltype(A), size(A, 1), m)
-
-  highest = lobpcg(A, true, X0, m).λ
-  lowest = lobpcg(A, false, X0, m).λ
-  mid_guess = log((highest[end] + lowest[end]) / 2)
-  logdet = sum(log.(highest)) + sum(log.(lowest)) + mid_guess * (k - (2 * m))
-  -0.5 * logdet -(k/2) * log(2 * pi) - 0.5 * quadform
+  -0.5 * logdet(post.data.C) -(k/2) * log(2 * pi) - 0.5 * quadform
 end
 
 end # module GridGP
